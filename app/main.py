@@ -8,7 +8,8 @@
   is set, a bearer token is required; without it the endpoint is open
   and the landing page says so plainly.
 
-The SQLite store is initialised (create + seed if empty) on startup.
+The notes store (SQLite by default, Postgres when DATABASE_URL is
+set) is initialised (create + seed if empty) on startup.
 If that fails, the app still boots and ``/api/health`` reports
 ``db: "error"`` instead of crashing — a missing database is an honest
 state, not a reason to refuse the healthcheck.
@@ -34,12 +35,16 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    active_store = store.get_store()
     try:
-        seeded = store.init_db(settings.DATABASE_PATH)
-        logger.info("SQLite store ready at %s (seeded %d notes)", settings.DATABASE_PATH, seeded)
+        seeded = active_store.init_db()
+        logger.info(
+            "%s store ready (seeded %d notes)",
+            active_store.backend, seeded,
+        )
     except store.StoreError as exc:
         # Boot anyway; /api/health reports db: "error" honestly.
-        logger.warning("SQLite store unavailable at startup: %s", exc)
+        logger.warning("%s store unavailable at startup: %s", active_store.backend, exc)
     # The MCP session manager's lifespan. Starlette does not propagate
     # lifespan to mounted sub-apps, so it must be entered here —
     # without it, /mcp 500s with "Task group is not initialized".
@@ -79,12 +84,14 @@ async def bearer_auth_middleware(request: Request, call_next):
 
 @app.get("/api/health")
 def health() -> JSONResponse:
-    db_ok = store.db_ok(settings.DATABASE_PATH)
+    active_store = store.get_store()
+    db_ok = active_store.db_ok()
     status = settings.config_status()
     return JSONResponse(
         content={
             "status": "ok" if db_ok else "degraded",
             "db": "ok" if db_ok else "error",
+            "backend": active_store.backend,
             "mcp": {
                 "server": settings.MCP_SERVER_NAME,
                 "protocol_version": settings.MCP_PROTOCOL_VERSION,
@@ -100,6 +107,12 @@ def health() -> JSONResponse:
 
 def _landing_html(base_url: str) -> str:
     mcp_url = f"{base_url}/mcp"
+    backend = store.get_store().backend
+    storage_line = (
+        "backed by a real Postgres notes store (DATABASE_URL is set)."
+        if backend == "postgres"
+        else "backed by a real SQLite notes store."
+    )
     auth_warning = (
         '<p><strong>Auth is enabled.</strong> Clients must send '
         '<code>Authorization: Bearer &lt;MCP_AUTH_TOKEN&gt;</code>.</p>'
@@ -116,16 +129,17 @@ def _landing_html(base_url: str) -> str:
 <body>
 <h1>{settings.MCP_SERVER_NAME} — MCP Starter</h1>
 <p>A production-wired MCP server (spec <strong>{settings.MCP_PROTOCOL_VERSION}</strong>,
-Python SDK 2.3.0) over Streamable HTTP, backed by a real SQLite notes store.
+Python SDK 2.3.0) over Streamable HTTP, {storage_line}
 Endpoint: <code>{mcp_url}</code></p>
 {auth_warning}
 <h2>Tools</h2>
 <table><tr><th>Tool</th><th>What it does</th></tr>
 <tr><td><code>add_numbers(a, b)</code></td><td>Add two numbers.</td></tr>
 <tr><td><code>echo(message)</code></td><td>Return the message unchanged.</td></tr>
-<tr><td><code>create_note(title, body)</code></td><td>Create a note in SQLite.</td></tr>
+<tr><td><code>create_note(title, body)</code></td><td>Create a note in the notes store.</td></tr>
 <tr><td><code>list_notes(limit=10)</code></td><td>List recent notes, newest first.</td></tr>
 <tr><td><code>search_notes(query)</code></td><td>Substring search over title/body.</td></tr>
+<tr><td><code>fetch_json(url)</code></td><td>Fetch JSON from an http(s) URL and return the parsed value (errors returned as plain text).</td></tr>
 </table>
 <h2>Resources</h2>
 <table><tr><th>URI</th><th>What it returns</th></tr>

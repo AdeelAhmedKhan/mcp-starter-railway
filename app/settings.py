@@ -24,6 +24,9 @@ def _env(name: str, default: str) -> str:
 MCP_SERVER_NAME: str = _env("MCP_SERVER_NAME", "mcp-starter")
 MCP_SERVER_VERSION: str = _env("MCP_SERVER_VERSION", "0.1.0")
 DATABASE_PATH: str = _env("DATABASE_PATH", "data/notes.db")
+# When set, notes live in Postgres instead of the SQLite file.
+# Empty (default) means SQLite at DATABASE_PATH.
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
 MCP_AUTH_TOKEN: str = os.environ.get("MCP_AUTH_TOKEN", "")
 PORT: int = int(_env("PORT", "8000"))
 
@@ -55,12 +58,29 @@ def auth_enabled() -> bool:
     return bool(MCP_AUTH_TOKEN)
 
 
+def store_backend() -> str:
+    """Which notes store is active: ``"postgres"`` when DATABASE_URL
+    is set, otherwise ``"sqlite"``."""
+    return "postgres" if DATABASE_URL else "sqlite"
+
+
 def config_status() -> dict:
     """Honest capability report — no capability is ever faked."""
+    backend = store_backend()
+    storage_note = (
+        "Postgres notes store via DATABASE_URL. On Railway this needs "
+        "a Postgres service (or DATABASE_URL pointing at one); notes "
+        "persist as long as that database does."
+        if backend == "postgres"
+        else "SQLite file at DATABASE_PATH. Without a Railway Volume "
+        "mounted at data/, the file is ephemeral and is lost on "
+        "redeploy."
+    )
     return {
         "server": MCP_SERVER_NAME,
         "version": MCP_SERVER_VERSION,
         "protocol_version": MCP_PROTOCOL_VERSION,
+        "backend": backend,
         "database_path": DATABASE_PATH,
         "auth": "enabled" if auth_enabled() else "disabled",
         "auth_note": (
@@ -69,11 +89,7 @@ def config_status() -> dict:
             else "No auth configured — the MCP endpoint is open. "
             "Set MCP_AUTH_TOKEN before exposing publicly."
         ),
-        "storage_note": (
-            "SQLite file at DATABASE_PATH. Without a Railway Volume "
-            "mounted at data/, the file is ephemeral and is lost on "
-            "redeploy."
-        ),
+        "storage_note": storage_note,
         "allowed_hosts": MCP_ALLOWED_HOSTS,
         "allowed_origins": MCP_ALLOWED_ORIGINS,
     }
