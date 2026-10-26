@@ -5,6 +5,8 @@
   prompts, unknown-tool error) against a live uvicorn process on an
   ephemeral port, using the official ``streamable_http_client`` +
   ``ClientSession``.
+- ``fetch_json`` against a LOCAL stub HTTP server (``http.server`` in
+  a thread) — never the real internet.
 
 Run: ``python -m pytest``
 """
@@ -15,7 +17,9 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -25,11 +29,20 @@ from fastapi.testclient import TestClient
 # Env must be set BEFORE importing the app (settings read at import).
 TEST_DB = Path(__file__).resolve().parents[1] / "data" / "test-notes.db"
 os.environ.setdefault("DATABASE_PATH", str(TEST_DB))
+os.environ.pop("DATABASE_URL", None)  # tests run on the SQLite backend
 os.environ.pop("MCP_AUTH_TOKEN", None)  # tests run with auth disabled
 
 from app.main import app  # noqa: E402
+from app.tools.external import MAX_RESPONSE_BYTES, fetch_json  # noqa: E402
 
-TOOL_NAMES = ["add_numbers", "echo", "create_note", "list_notes", "search_notes"]
+TOOL_NAMES = [
+    "add_numbers",
+    "echo",
+    "create_note",
+    "list_notes",
+    "search_notes",
+    "fetch_json",
+]
 
 
 def _free_port() -> int:
@@ -82,6 +95,7 @@ def test_health_full_body(http_client):
     body = resp.json()
     assert body["status"] in ("ok", "degraded")
     assert body["db"] in ("ok", "error")
+    assert body["backend"] == "sqlite"  # DATABASE_URL unset in tests
     assert body["mcp"]["server"] == "mcp-starter"
     assert body["mcp"]["protocol_version"] == "2026-07-28"
     assert body["mcp"]["tools"] == TOOL_NAMES
@@ -96,9 +110,114 @@ def test_landing_page(http_client):
     assert "MCP" in resp.text
     assert "/mcp" in resp.text
     assert "add_numbers" in resp.text
+    assert "fetch_json" in resp.text
     assert "notes://all" in resp.text
     assert "summarize-notes" in resp.text
     assert "No auth configured" in resp.text
+
+
+# ------------------------------------------------- fetch_json stub server
+# A tiny local HTTP server (threaded, ephemeral port) so fetch_json
+# is exercised over real HTTP without touching the internet.
+
+
+class _StubHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # silence request logging
+        pass
+
+    def _send(self, status, body: bytes, content_type="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # fetch_json stops reading once the 1 MB limit is hit and
+            # closes the connection mid-body; that is the point of /big.
+            pass
+
+    def do_GET(self):
+        if self.path == "/ok":
+            self._send(200, b'{"hello": "world", "n": 42}')
+        elif self.path == "/notfound":
+            self._send(404, b'{"error": "nope"}')
+        elif self.path == "/badjson":
+            self._send(200, b"this is not json", "text/plain")
+        elif self.path == "/big":
+            # 1 byte over the limit; Content-Length declares it up front.
+            self._send(200, b"x" * (MAX_RESPONSE_BYTES + 1))
+        elif self.path == "/slow":
+            time.sleep(12)  # longer than fetch_json's 10s timeout
+            self._send(200, b'{"slow": true}')
+        elif self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._send(404, b'{"error": "unknown stub path"}')
+
+
+@pytest.fixture(scope="module")
+def stub_server():
+    """Local stub HTTP server; yields its base URL (http://127.0.0.1:port)."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_fetch_json_success(stub_server):
+    result = fetch_json(f"{stub_server}/ok")
+    assert result == {"hello": "world", "n": 42}
+
+
+def test_fetch_json_redirect_followed(stub_server):
+    result = fetch_json(f"{stub_server}/redirect")
+    assert result == {"hello": "world", "n": 42}
+
+
+def test_fetch_json_non_200(stub_server):
+    result = fetch_json(f"{stub_server}/notfound")
+    assert isinstance(result, str)
+    assert "404" in result
+
+
+def test_fetch_json_invalid_json(stub_server):
+    result = fetch_json(f"{stub_server}/badjson")
+    assert isinstance(result, str)
+    assert "not valid JSON" in result
+
+
+def test_fetch_json_too_large(stub_server):
+    result = fetch_json(f"{stub_server}/big")
+    assert isinstance(result, str)
+    assert "1 MB" in result
+
+
+def test_fetch_json_timeout(stub_server):
+    # Takes ~10s: the stub sleeps 12s, fetch_json times out at 10s.
+    result = fetch_json(f"{stub_server}/slow")
+    assert isinstance(result, str)
+    assert "timed out" in result
+
+
+def test_fetch_json_rejects_non_http():
+    result = fetch_json("file:///etc/passwd")
+    assert isinstance(result, str)
+    assert "only http" in result
+
+
+def test_fetch_json_rejects_garbage_url():
+    result = fetch_json("not a url")
+    assert isinstance(result, str)
+    assert "only http" in result
 
 
 # ------------------------------------------------------------- MCP flow
@@ -113,6 +232,7 @@ def live_server(tmp_path_factory):
     env["DATABASE_PATH"] = str(db_path)
     env["PORT"] = str(port)
     env.pop("MCP_AUTH_TOKEN", None)
+    env.pop("DATABASE_URL", None)
     root = Path(__file__).resolve().parents[1]
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app",
@@ -148,7 +268,7 @@ def live_server(tmp_path_factory):
             proc.kill()
 
 
-def _run_mcp_flow(base_url: str) -> dict:
+def _run_mcp_flow(base_url: str, stub_url: str) -> dict:
     """Drive the whole MCP flow with the official client. Returns evidence."""
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
@@ -180,6 +300,12 @@ def _run_mcp_flow(base_url: str) -> dict:
                 result = await session.call_tool(
                     "search_notes", {"query": "MCP flow"})
                 evidence["search_notes"] = _tool_value(result)
+                result = await session.call_tool(
+                    "fetch_json", {"url": f"{stub_url}/ok"})
+                evidence["fetch_json"] = _tool_value(result)
+                result = await session.call_tool(
+                    "fetch_json", {"url": f"{stub_url}/notfound"})
+                evidence["fetch_json_404"] = _tool_value(result)
                 resources = await session.list_resources()
                 evidence["resources"] = sorted(r.uri for r in resources.resources)
                 templates = await session.list_resource_templates()
@@ -204,8 +330,8 @@ def _run_mcp_flow(base_url: str) -> dict:
     return asyncio.run(flow())
 
 
-def test_mcp_flow_live(live_server):
-    ev = _run_mcp_flow(live_server)
+def test_mcp_flow_live(live_server, stub_server):
+    ev = _run_mcp_flow(live_server, stub_server)
     assert ev["tools"] == sorted(TOOL_NAMES)
     assert ev["add_numbers"] == 5.0
     assert ev["echo"] == "hello mcp"
@@ -215,6 +341,9 @@ def test_mcp_flow_live(live_server):
     assert created_id in listed_ids
     assert len(ev["list_notes"]) >= 4  # 3 seeded + at least the created one
     assert any(n["id"] == created_id for n in ev["search_notes"])
+    assert ev["fetch_json"] == {"hello": "world", "n": 42}
+    assert isinstance(ev["fetch_json_404"], str)
+    assert "404" in ev["fetch_json_404"]
     assert "notes://all" in ev["resources"]
     assert "notes://{id}" in ev["resource_templates"]
     assert any(n["id"] == created_id for n in ev["notes_all"])
